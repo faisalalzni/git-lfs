@@ -28,6 +28,12 @@ var (
 	ErrLockAmbiguous = errors.New("lfs: multiple locks found; ambiguous")
 )
 
+const (
+	// MaxLockSearchLimit is how many search results to request when
+	// trying to find matching locks for a multiple file unlock request
+	MaxLockSearchLimit = 1000
+)
+
 type LockCacher interface {
 	Add(l Lock) error
 	RemoveByPath(filePath string) error
@@ -45,6 +51,7 @@ type Client struct {
 	cache     LockCacher
 	cacheDir  string
 	cfg       *config.Configuration
+	gitRoot   string
 
 	lockablePatterns []string
 	lockableFilter   *filepathfilter.Filter
@@ -54,17 +61,26 @@ type Client struct {
 	LocalGitDir              string
 	SetLockableFilesReadOnly bool
 	ModifyIgnoredFiles       bool
+
+	ConcurrentRequests int
 }
 
 // NewClient creates a new locking client with the given configuration
 // You must call the returned object's `Close` method when you are finished with
 // it
 func NewClient(remote string, lfsClient *lfsapi.Client, cfg *config.Configuration) (*Client, error) {
+	root, err := git.RootDir()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
 		Remote:             remote,
 		client:             &lockClient{Client: lfsClient},
 		cache:              &nilLockCacher{},
 		cfg:                cfg,
+		gitRoot:            root,
+		ConcurrentRequests: lfsClient.ConcurrentTransfers(),
 		ModifyIgnoredFiles: lfsClient.GitEnv().Bool("lfs.lockignoredfiles", false),
 	}, nil
 }
@@ -119,10 +135,7 @@ func (c *Client) LockFile(path string) (Lock, error) {
 		return Lock{}, errors.Wrap(err, "lock cache")
 	}
 
-	abs, err := getAbsolutePath(path)
-	if err != nil {
-		return Lock{}, errors.Wrap(err, "make lockpath absolute")
-	}
+	abs := filepath.Join(c.gitRoot, path)
 
 	// Ensure writeable on return
 	if err := tools.SetFileWriteFlag(abs, true); err != nil {
@@ -130,6 +143,41 @@ func (c *Client) LockFile(path string) (Lock, error) {
 	}
 
 	return lock, nil
+}
+
+// LockMultipleFiles locks multiple files.
+func (c *Client) LockMultipleFiles(paths []string) ([]Lock, error) {
+	errs := make([]error, 0, len(paths))
+	locks := make([]Lock, 0, len(paths))
+	mutex := sync.Mutex{}
+
+	requestLimiter := make(chan struct{}, c.ConcurrentRequests)
+	for _, path := range paths {
+		requestLimiter <- struct{}{}
+
+		go func(path string) {
+			defer func() { <-requestLimiter }()
+
+			lock, err := c.LockFile(path)
+
+			mutex.Lock()
+			if err != nil {
+				errs = append(errs, errors.Wrap(err, path))
+			} else {
+				locks = append(locks, lock)
+			}
+			mutex.Unlock()
+		}(path)
+	}
+
+	for i := 0; i < cap(requestLimiter); i++ {
+		requestLimiter <- struct{}{}
+	}
+
+	if len(errs) > 0 {
+		return locks, errors.Combine(errs)
+	}
+	return locks, nil
 }
 
 // getAbsolutePath takes a repository-relative path and makes it absolute.
@@ -159,6 +207,95 @@ func (c *Client) UnlockFile(path string, force bool) error {
 	return c.UnlockFileById(id, force)
 }
 
+// UnlockMultipleFiles unlocks multiple files.
+func (c *Client) UnlockMultipleFiles(paths []string, force bool) ([]Lock, error) {
+	// Despite the API here looking like it can support multiple lock filters,
+	// the backend HTTP API can only support one.
+	// Here we fetch one result if we're only unlocking one file, or all locks
+	// if we're unlocking multiple to perform client-side matching.
+	req := &lockSearchRequest{Limit: MaxLockSearchLimit}
+	if len(paths) == 1 {
+		req.Filters = []lockFilter{{
+			Property: "path",
+			Value:    paths[0],
+		}}
+	}
+
+	matching := make([]*Lock, 0, len(paths))
+	missing := make(map[string]struct{})
+	for _, path := range paths {
+		missing[path] = struct{}{}
+	}
+
+	for {
+		list, _, err := c.client.Search(c.Remote, req)
+		if err != nil {
+			return []Lock{}, err
+		}
+
+		for i := range list.Locks {
+			for _, path := range paths {
+				if list.Locks[i].Path == path {
+					matching = append(matching, &list.Locks[i])
+					delete(missing, path)
+					break
+				}
+			}
+		}
+
+		if len(missing) == 0 {
+			break
+		}
+		if list.NextCursor == "" {
+			break
+		}
+		req.Cursor = list.NextCursor
+	}
+
+	errs := make([]error, 0, len(matching))
+	locks := make([]Lock, 0, len(matching))
+	mutex := sync.Mutex{}
+
+	switch true {
+	case len(paths) == 1 && len(matching) == 0:
+		return locks, ErrNoMatchingLocks
+	case len(paths) == 1 && len(matching) > 1:
+		return locks, ErrLockAmbiguous
+	case len(missing) > 0:
+		for path := range missing {
+			errs = append(errs, errors.Wrap(ErrNoMatchingLocks, path))
+		}
+	}
+
+	requestLimiter := make(chan struct{}, c.ConcurrentRequests)
+	for i := range matching {
+		requestLimiter <- struct{}{}
+
+		go func(idx int) {
+			defer func() { <-requestLimiter }()
+
+			err := c.UnlockFileById(matching[idx].Id, force)
+
+			mutex.Lock()
+			if err != nil {
+				errs = append(errs, errors.Wrap(err, matching[idx].Path))
+			} else {
+				locks = append(locks, *matching[idx])
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	for i := 0; i < cap(requestLimiter); i++ {
+		requestLimiter <- struct{}{}
+	}
+
+	if len(errs) > 0 {
+		return locks, errors.Combine(errs)
+	}
+	return locks, nil
+}
+
 // UnlockFileById attempts to unlock a lock with a given id on the current remote
 // Force causes the file to be unlocked from other users as well
 func (c *Client) UnlockFileById(id string, force bool) error {
@@ -179,10 +316,7 @@ func (c *Client) UnlockFileById(id string, force bool) error {
 	}
 
 	if unlockRes.Lock != nil {
-		abs, err := getAbsolutePath(unlockRes.Lock.Path)
-		if err != nil {
-			return errors.Wrap(err, "make lockpath absolute")
-		}
+		abs := filepath.Join(c.gitRoot, unlockRes.Lock.Path)
 
 		// Make non-writeable if required
 		if c.SetLockableFilesReadOnly && c.IsFileLockable(unlockRes.Lock.Path) {

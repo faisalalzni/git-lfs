@@ -3,6 +3,8 @@ package lfshttp
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"regexp"
 
@@ -81,6 +83,7 @@ func DecodeJSON(res *http.Response, obj interface{}) error {
 	}
 
 	err := json.NewDecoder(res.Body).Decode(obj)
+	io.Copy(ioutil.Discard, res.Body)
 	res.Body.Close()
 
 	if err != nil {

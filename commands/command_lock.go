@@ -19,13 +19,17 @@ var (
 
 func lockCommand(cmd *cobra.Command, args []string) {
 	if len(args) == 0 {
-		Print("Usage: git lfs lock <path>")
+		Print("Usage: git lfs lock <path>...")
 		return
 	}
 
-	path, err := lockPath(args[0])
-	if err != nil {
-		Exit(err.Error())
+	paths := make([]string, len(args))
+	var err error
+	for i, path := range args {
+		paths[i], err = lockPath(path)
+		if err != nil {
+			Exit(err.Error())
+		}
 	}
 
 	if len(lockRemote) > 0 {
@@ -37,19 +41,26 @@ func lockCommand(cmd *cobra.Command, args []string) {
 	lockClient.RemoteRef = refUpdate.Right()
 	defer lockClient.Close()
 
-	lock, err := lockClient.LockFile(path)
+	locks, err := lockClient.LockMultipleFiles(paths)
 	if err != nil {
-		Exit("Lock failed: %v", errors.Cause(err))
+		Error("Lock failed: %v", errors.Cause(err))
 	}
-
 	if locksCmdFlags.JSON {
-		if err := json.NewEncoder(os.Stdout).Encode(lock); err != nil {
-			Error(err.Error())
+		encoder := json.NewEncoder(os.Stdout)
+		for _, lock := range locks {
+			if err := encoder.Encode(lock); err != nil {
+				Error(err.Error())
+			}
 		}
-		return
+	} else {
+		for _, lock := range locks {
+			Print("Locked %s", lock.Path)
+		}
 	}
 
-	Print("Locked %s", path)
+	if err != nil {
+		os.Exit(2)
+	}
 }
 
 // lockPaths relativizes the given filepath such that it is relative to the root
