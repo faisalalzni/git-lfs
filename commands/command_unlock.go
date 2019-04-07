@@ -24,7 +24,7 @@ type unlockFlags struct {
 	Force bool
 }
 
-var unlockUsage = "Usage: git lfs unlock (--id my-lock-id | <path>)"
+var unlockUsage = "Usage: git lfs unlock (--id my-lock-id | <path>...)"
 
 func unlockCommand(cmd *cobra.Command, args []string) {
 	hasPath := len(args) > 0
@@ -45,26 +45,48 @@ func unlockCommand(cmd *cobra.Command, args []string) {
 	defer lockClient.Close()
 
 	if hasPath {
-		path, err := lockPath(args[0])
-		if err != nil {
-			if !unlockCmdFlags.Force {
-				Exit("Unable to determine path: %v", err.Error())
+		paths := make([]string, len(args))
+		var err error
+		for i, path := range args {
+			paths[i], err = lockPath(path)
+			if err != nil {
+				if !unlockCmdFlags.Force {
+					Exit("Unable to determine path: %v", err.Error())
+				}
+				paths[i] = path
 			}
-			path = args[0]
+
+			// This call can early-out
+			unlockAbortIfFileModified(paths[i])
 		}
 
-		// This call can early-out
-		unlockAbortIfFileModified(path)
-
-		err = lockClient.UnlockFile(path, unlockCmdFlags.Force)
+		locks, err := lockClient.UnlockMultipleFiles(paths, unlockCmdFlags.Force)
 		if err != nil {
-			Exit("%s", errors.Cause(err))
+			Error("%s", errors.Cause(err))
 		}
 
 		if !locksCmdFlags.JSON {
-			Print("Unlocked %s", path)
-			return
+			for _, lock := range locks {
+				Print("Unlocked %s", lock.Path)
+			}
+		} else {
+			encoder := json.NewEncoder(os.Stdout)
+
+			type lockData struct {
+				locking.Lock
+				Unlocked bool `json:"unlocked"`
+			}
+			for _, lock := range locks {
+				if err := encoder.Encode(lockData{lock, true}); err != nil {
+					Error(err.Error())
+				}
+			}
 		}
+
+		if err != nil {
+			os.Exit(2)
+		}
+		return
 	} else if unlockCmdFlags.Id != "" {
 		// This call can early-out
 		unlockAbortIfFileModifiedById(unlockCmdFlags.Id, lockClient)
